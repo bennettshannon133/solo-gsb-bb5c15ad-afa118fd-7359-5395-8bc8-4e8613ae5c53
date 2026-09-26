@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 
@@ -18,6 +18,10 @@ from .models import (
     CheckinOut,
     CheckinSelection,
     CorrectionPreview,
+    NeutralWindow,
+    NeutralizedCreate,
+    NeutralizedOut,
+    NeutralizedSegment,
     PreviewCorrectionOut,
     PublicationOut,
     RunnerPreview,
@@ -515,6 +519,119 @@ def preview_correction(
         occurred_at=occurred,
         corrects=payload.corrects,
         affected_runners=affected,
+    )
+
+
+# ---------- 中立时段试算 ----------
+
+
+def _merge_windows(
+    windows: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """合并重叠或相接的时间窗；返回按起点升序、互不重叠也不相接的窗口。"""
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in sorted(windows):
+        if merged and start <= merged[-1][1]:
+            last_start, last_end = merged[-1]
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _overlap_seconds(
+    start: datetime, end: datetime, windows: list[tuple[datetime, datetime]]
+) -> int:
+    """[start, end] 与若干互不重叠时间窗的交集总秒数。"""
+    total = timedelta(0)
+    for ws, we in windows:
+        lo, hi = max(start, ws), min(end, we)
+        if hi > lo:
+            total += hi - lo
+    return int(total.total_seconds())
+
+
+def compute_neutralized_splits(
+    conn: sqlite3.Connection, runner_id: str, payload: NeutralizedCreate
+) -> NeutralizedOut:
+    """中立时段试算：评估暂停计时后的净成绩。
+
+    - 时间窗统一转 UTC（无时区按 UTC 处理），终点不晚于起点的区间拒绝（422）；
+    - 先合并重叠或相接的时间窗，再按各有效分段的起终打卡时间裁剪扣除：
+      合并后的窗口互不重叠，且每段只在自己 [起, 终] 区间内交集，
+      因此跨段或重叠不会重复扣秒；
+    - 原始分段复用"仅有效打卡 + 同站最早入选 + 相邻站"规则，与实时分段
+      来自同一次数据库读取；补传、更正、撤销后重新请求即反映最新打卡；
+    - 缺站或时间倒退的分段保持待定；只有全部分段有效时给出净总秒数；
+    - 纯试算：不写入数据库，不影响实时成绩与已发布版本。
+    """
+    windows: list[tuple[datetime, datetime]] = []
+    for i, w in enumerate(payload.windows):
+        start, end = _to_utc(w.start), _to_utc(w.end)
+        if end <= start:
+            raise HTTPException(
+                status_code=422,
+                detail=f"第 {i} 个时间窗终点 {end.isoformat()} "
+                f"不晚于起点 {start.isoformat()}",
+            )
+        windows.append((start, end))
+    merged = _merge_windows(windows)
+
+    any_row = conn.execute(
+        "SELECT 1 FROM checkins WHERE runner_id = ? LIMIT 1", (runner_id,)
+    ).fetchone()
+    if any_row is None:
+        raise HTTPException(status_code=404, detail=f"选手 {runner_id} 无任何打卡记录")
+
+    # 与实时分段同一次读取：仅有效打卡、同站最早入选、相邻站重算
+    rows = conn.execute(
+        "SELECT * FROM checkins WHERE runner_id = ? AND status = ?",
+        (runner_id, ACTIVE),
+    ).fetchall()
+    best = _select_best(rows)
+    splits = _splits_from_best(best, runner_id)
+
+    segments: list[NeutralizedSegment] = []
+    for seg in splits.segments:
+        if seg.status != "ok":
+            segments.append(
+                NeutralizedSegment(
+                    from_station=seg.from_station,
+                    to_station=seg.to_station,
+                    status="pending",
+                    reason=seg.reason,
+                )
+            )
+            continue
+        start_t, end_t = best[seg.from_station][0], best[seg.to_station][0]
+        deducted = _overlap_seconds(start_t, end_t, merged)
+        segments.append(
+            NeutralizedSegment(
+                from_station=seg.from_station,
+                to_station=seg.to_station,
+                status="ok",
+                raw_seconds=seg.duration_seconds,
+                deducted_seconds=deducted,
+                net_seconds=seg.duration_seconds - deducted,
+            )
+        )
+
+    complete = splits.complete
+    total = splits.total_seconds if complete else None
+    deducted_total = (
+        sum(s.deducted_seconds for s in segments) if complete else None
+    )
+    net_total = total - deducted_total if complete else None
+    return NeutralizedOut(
+        runner_id=runner_id,
+        station_count=splits.station_count,
+        complete=complete,
+        windows=[NeutralWindow(start=s, end=e) for s, e in merged],
+        segments=segments,
+        total_seconds=total,
+        deducted_seconds=deducted_total,
+        net_seconds=net_total,
+        net=_fmt_duration(net_total) if net_total is not None else None,
     )
 
 

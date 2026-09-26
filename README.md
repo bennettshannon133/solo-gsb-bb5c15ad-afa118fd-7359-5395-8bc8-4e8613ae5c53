@@ -13,6 +13,9 @@
   仅 `active` 参与，同站按 (UTC 时间, 事件号) 升序选一条，未入选记录说明原因
   （已更正 / 已撤销 / 较晚 / 同时间平局），并同返回按入选事件计算的现有分段，
   解释与分段基于**同一次数据库读取**；
+- 提供**中立时段试算**：提交若干起止时间窗（统一转 UTC，重叠或相接的先合并），
+  按各有效分段的起终打卡时间裁剪扣除暂停计时，逐段返回原始 / 扣除 / 净秒数，
+  全部有效时给出净总秒数；纯试算**不写库**，不影响实时成绩与已发布版本；
 - 支持**成绩发布**：在同一 SQLite 事务内读取当前打卡、按现有分段规则为所有有记录选手
   （含未完赛、保留 `pending` 分段者）生成**单调递增、不可变的版本快照**并整版原子保存；
 - 已发布版本按版本号 / 最新版查询；后续打卡、更正或撤销只影响实时成绩，**不改已发布版本**；
@@ -52,6 +55,7 @@ Compose 通过命名卷 `timing-data` 持久化数据；删除卷（`docker comp
 | `GET` | `/api/checkins/{event_no}` | 按事件号查询单条打卡 |
 | `GET` | `/api/runners/{runner_id}/splits` | 选手实时分段结果 |
 | `GET` | `/api/runners/{runner_id}/splits/explain` | 分段入选解释：按站点列出全部打卡及是否入选（含原因），并返回按入选事件计算的现有分段 |
+| `POST` | `/api/runners/{runner_id}/splits/neutralized` | 中立时段试算：扣除暂停计时后的净成绩，逐段返回原始 / 扣除 / 净秒数（纯试算，不写库） |
 | `POST` | `/api/publications` | 发布成绩版本：同一事务读取当前打卡、整版快照原子保存，返回新版本完整成绩 |
 | `GET` | `/api/publications/{version}` | 按版本号查询该版本完整成绩（不存在返回 404） |
 | `GET` | `/api/publications/latest` | 查询最新发布版本完整成绩（尚未发布时返回 404） |
@@ -223,6 +227,57 @@ curl http://localhost:8000/api/runners/R004/splits/explain
 }
 ```
 
+## 中立时段试算
+
+赛事方可提交若干中立时段（暂停计时）的起止时间，评估扣除后的净成绩
+（选手无任何打卡记录时返回 `404`）：
+
+```bash
+curl -X POST http://localhost:8000/api/runners/R001/splits/neutralized \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "windows": [
+      {"start": "2026-09-25T08:10:00", "end": "2026-09-25T08:20:00"},
+      {"start": "2026-09-25T16:15:00+08:00", "end": "2026-09-25T16:25:00+08:00"}
+    ]
+  }'
+```
+
+规则：
+
+- 原始分段复用实时成绩的"仅有效打卡 + 同站最早入选 + 相邻站"规则，与实时分段
+  基于**同一次数据库读取**生成；补传、更正、撤销后重新请求即反映最新打卡；
+- 时间窗统一转 UTC（无时区按 UTC 处理，可混用带时区偏移的写法，如上例）；
+  **终点不晚于起点的区间返回 `422`**；
+- 重叠或相接的时间窗**先合并**，再按各有效分段的起终打卡时间**裁剪扣除**，
+  跨段或重叠不会重复扣秒；响应中的 `windows` 回显合并后的 UTC 时间窗；
+- 逐段返回 `raw_seconds`（原始秒数）、`deducted_seconds`（扣除秒数）、
+  `net_seconds`（净秒数）；缺站或时间倒退的分段保持 `pending`，三项均为 `null`；
+- 只有全部分段有效时才给出 `total_seconds` / `deducted_seconds` / `net_seconds`
+  （净总秒数）与 `net`（H:MM:SS），否则均为 `null`；
+- **纯试算**：不写入数据库，不改变实时成绩与已发布版本。
+
+响应节选（上例两个时间窗合并为 08:10–08:25 UTC，落在分段 1→2 内）：
+
+```json
+{
+  "runner_id": "R001",
+  "station_count": 6,
+  "complete": true,
+  "windows": [
+    {"start": "2026-09-25T08:10:00Z", "end": "2026-09-25T08:25:00Z"}
+  ],
+  "segments": [
+    {"from_station": 1, "to_station": 2, "status": "ok", "raw_seconds": 1920, "deducted_seconds": 900, "net_seconds": 1020},
+    {"from_station": 2, "to_station": 3, "status": "ok", "raw_seconds": 2400, "deducted_seconds": 0, "net_seconds": 2400}
+  ],
+  "total_seconds": 12600,
+  "deducted_seconds": 900,
+  "net_seconds": 11700,
+  "net": "3:15:00"
+}
+```
+
 ## 成绩发布与版本查询
 
 发布（无需请求体）：在**同一 SQLite 事务**内先取得写锁再读取全部当前打卡，按现有分段规则
@@ -317,6 +372,10 @@ pytest                               # 运行测试
 - 批量登记在同一数据库事务内按顺序处理全部记录，任一失败即整体回滚（含已做的状态变更），
   成功时基于全部新数据按现有分段规则重算受影响选手的最终完成状态与总用时；
 - 更正预演复用正式更正的校验与写入逻辑，在 `SAVEPOINT` 内试算后 `ROLLBACK TO` 整体回滚，对数据库零副作用；
+- 中立时段试算与实时分段共用"同站最早入选 + 相邻站重算"规则并在同一次读取上推导；
+  时间窗统一转 UTC 后先合并重叠 / 相接区间，再与各有效分段的 [起, 终] 区间求交集扣除，
+  合并后的窗口互不重叠、每段独立裁剪，因此跨段或重叠不会重复扣秒；试算只读不写，
+  不影响实时成绩与已发布版本；
 - 成绩发布在 `BEGIN IMMEDIATE` 事务内"先取写锁、再读全部打卡"，版本头（`publications`，
   `INTEGER PRIMARY KEY AUTOINCREMENT` 保证版本号单调递增、不重用）与全体选手快照
   （`publication_entries`，逐选手 `SplitsOut` JSON）在同一事务内原子提交；持锁期间并发打卡 /
