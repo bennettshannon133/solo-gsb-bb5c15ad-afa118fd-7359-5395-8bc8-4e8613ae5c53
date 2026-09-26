@@ -170,6 +170,63 @@ class PreviewCorrectionOut(BaseModel):
     )
 
 
+class NeutralWindow(BaseModel):
+    """一段中立（暂停计时）时段的起止时间。"""
+
+    start: datetime = Field(..., description="中立时段起点，ISO 8601；无时区按 UTC 处理")
+    end: datetime = Field(..., description="中立时段终点，ISO 8601；须晚于起点")
+
+
+class NeutralizedCreate(BaseModel):
+    """中立时段试算请求：若干起止时间，重叠或相接的窗口会先合并再扣除。"""
+
+    windows: list[NeutralWindow] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="中立时段（起止时间）列表，1~100 段；统一转 UTC 后合并重叠或相接的窗口",
+    )
+
+
+class NeutralWindowOut(BaseModel):
+    """合并后的中立时段（UTC）。"""
+
+    start: datetime
+    end: datetime
+
+
+class NeutralizedSegment(BaseModel):
+    """单个分段扣除中立时段后的试算结果；待定分段保持待定。"""
+
+    from_station: int
+    to_station: int
+    status: Literal["ok", "pending"]
+    raw_seconds: Optional[int] = Field(default=None, description="分段原始秒数")
+    deducted_seconds: Optional[int] = Field(
+        default=None, description="被中立时段覆盖而扣除的秒数"
+    )
+    net_seconds: Optional[int] = Field(default=None, description="扣除后的净秒数")
+    reason: Optional[str] = Field(default=None, description="待定原因")
+
+
+class NeutralizedOut(BaseModel):
+    """中立时段试算响应：纯试算，不写入数据库，不影响实时成绩与已发布版本。"""
+
+    runner_id: str
+    station_count: int
+    complete: bool = Field(..., description="所有分段均有效时为 true")
+    windows: list[NeutralWindowOut] = Field(
+        ..., description="合并后的中立时段（UTC，按起点升序，互不重叠）"
+    )
+    segments: list[NeutralizedSegment] = Field(
+        ..., description="逐段原始秒数、扣除秒数与净秒数；待定分段保持待定"
+    )
+    net_total_seconds: Optional[int] = Field(
+        default=None, description="净总秒数，仅全部分段有效时给出"
+    )
+    net_total: Optional[str] = Field(default=None, description="净总用时，H:MM:SS")
+
+
 class PublicationOut(BaseModel):
     """一个已发布版本的完整成绩快照。"""
 
